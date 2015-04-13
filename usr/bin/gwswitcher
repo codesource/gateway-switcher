@@ -1,0 +1,539 @@
+#!/bin/bash
+
+###############################################################################
+## This script switch allow switching between 2 gateway
+## It will check that connectivity is ok before changing it
+## It use METRIC parameter so if router goes down system will automaticly
+## swith to the other one
+##
+## Copyright: 2015 Matthias Toscanelli <m.toscanelli@code-source.ch>
+## Licence: GPLv3 https://www.gnu.org/copyleft/gpl.html
+##
+## This script is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+###############################################################################
+
+
+
+#######################################
+# Variable definitions
+
+## GATEWAY1
+IP_GATEWAY1=
+NETWORK_GATEWAY1=
+TABLE_GATEWAY1=
+IFACE_GATEWAY1=
+METRIC_GATEWAY1=0
+TEST_IP_GATEWAY1=
+TEST_NETWORK_GATEWAY1=
+TEST_IFACE_GATEWAY1=
+TEST_RESULT_GATEWAY1=
+
+## GATEWAY2
+IP_GATEWAY2=
+NETWORK_GATEWAY2=
+TABLE_GATEWAY2=
+IFACE_GATEWAY2=
+METRIC_GATEWAY2=0
+TEST_IP_GATEWAY2=
+TEST_NETWORK_GATEWAY2=
+TEST_IFACE_GATEWAY2=
+TEST_RESULT_GATEWAY2=
+
+## OTHERS
+TEST_REFERENCE=
+RULES_DIRECTORY=
+CONFIG_FILE="/etc/gwswitcher/gwswitcher.ini"
+CURRENT_GATEWAY=`route | grep default | sed -e 's/\s\+/ /g' | cut -d" " -f2 | head -n 1`
+DEFAULT_GATEWAY=
+IFDOWN=
+RUNTEST=
+
+#######################################
+# Function definitions
+
+#######################################
+# Colorize text
+# Globals:
+#   None
+# Arguments
+#   text: The text that will be colored
+#   color: The text's color
+# Returns:
+#   The colored text
+#######################################
+function colorize(){
+  local esc="\x1b["
+  local reset=$esc"39;49;00m"
+  local red=$esc"31;01m"
+  local green=$esc"32;01m"
+  local yellow=$esc"33;01m"
+  local blue=$esc"34;01m"
+  local magenta=$esc"35;01m"
+  local cyan=$esc"36;01m"
+  local text="$1"
+
+  case $2 in
+    red)
+      text="$red$text$reset"
+      ;;
+    green)
+      text="$green$text$reset"
+      ;;
+    yellow)
+      text="$yellow$text$reset"
+      ;;
+    blue)
+      text="$blue$text$reset"
+      ;;
+    magenta)
+      text="$magenta$text$reset"
+      ;;
+    cyan)
+      text="$cyan$text$reset"
+      ;;
+  esac
+  echo -e "$text"
+}
+
+
+#######################################
+# Parse configuration file and affect global variable
+# Globals:
+#   IP_GATEWAY1
+#   NETWORK_GATEWAY1
+#   TABLE_GATEWAY1
+#   TEST_IP_GATEWAY1
+#   TEST_IFACE_GATEWAY1
+#   TEST_NETWORK_GATEWAY1
+#   IP_GATEWAY2
+#   NETWORK_GATEWAY2
+#   TABLE_GATEWAY2
+#   TEST_IP_GATEWAY2
+#   TEST_IFACE_GATEWAY2
+#   TEST_NETWORK_GATEWAY2
+#   TEST_REFERENCE
+# Arguments
+#   configuration file: The file containing all configuration
+# Returns:
+#   None
+#######################################
+configure_with (){
+  if [[ ! -f "$1" ]] ; then
+    colorize "Configuration file not found!" red
+    exit 1;
+  fi
+  while IFS='= ' read var val ; do
+      if [[ $var == \[*] ]] ; then
+          section=${var//\]}
+          section=${section//\[}
+      elif [[ $val ]] ; then
+        if [[ 'gateway1 gateway2' =~ $section ]] && [[ 'ip network table test_ip test_network test_iface' =~ $var ]] ; then
+          eval "${var^^}_${section^^}='"${val//\'/\'\"\'\"\'}"'"
+        elif [[ 'other' == $section ]] && [[ 'test_reference rules_directory' =~ $var ]] ; then
+          eval "${var^^}='"${val//\'/\'\"\'\"\'}"'"
+        fi
+      fi
+  done < "$1"
+}
+
+#######################################
+# Deep remove all rule for ip/range
+# Globals:
+#   None
+# Arguments
+#   ip: The address IP from witch rules should be deleted
+# Returns:
+#   None
+#######################################
+function del_rule(){
+	ip rule del from "$1" > /dev/null 2> /dev/null
+  while [[ -n "$(ip rule show | grep "from $1")" ]] ; do
+    ip rule del from "$1" > /dev/null 2> /dev/null
+  done
+}
+
+#######################################
+# Add a rule for a ip/range on a table
+# Globals:
+#   IP_GATEWAY1
+#   TABLE_GATEWAY1
+#   IP_GATEWAY2
+#   TABLE_GATEWAY2
+# Arguments
+#   ip: The address IP from witch rules should be added
+#   table: The destination table
+# Returns:
+#   None
+function add_rule(){
+  if [[ $# -eq 2 ]] ; then
+    del_rule "$1"
+    if [[ "$2" == "$TABLE_GATEWAY1" ]] ; then
+      ping -q -w 1 -c 1 "$IP_GATEWAY1" > /dev/null 2> /dev/null
+      if [[ $? -eq 0 ]] ; then
+        ip rule add from "$1" table "$TABLE_GATEWAY1" > /dev/null 2> /dev/null
+      fi
+    fi
+    if [[ "$2" == "$TABLE_GATEWAY2" ]] ; then
+      ping -q -w 1 -c 1 "$IP_GATEWAY2" > /dev/null 2> /dev/null
+      if [[ $? -eq 0 ]] ; then
+        ip rule add from "$1" table "$TABLE_GATEWAY2" > /dev/null 2> /dev/null
+      fi
+    fi
+  fi
+}
+
+#######################################
+# Test the connectivity to internet of the gateway linked to a table
+# Globals:
+#   TABLE_GATEWAY1
+#   TEST_IP_GATEWAY1
+#   TEST_IFACE_GATEWAY1
+#   TEST_NETWORK_GATEWAY1
+#   TABLE_GATEWAY2
+#   TEST_IP_GATEWAY2
+#   TEST_IFACE_GATEWAY2
+#   TEST_NETWORK_GATEWAY2
+#   TEST_REFERENCE
+# Arguments
+#   table: Reference table to gateway that will be tested
+# Returns:
+#   Return the result of the test (0=OK, >0=FAILED)
+function test_table_connectivity(){
+	local result=0
+  # TODO(matthias): Make sure that iptable ACCEPT ping from TEST_IP_GATEWAY1 to TEST_REFERENCE
+	if [[ "$1" == "$TABLE_GATEWAY1" ]] ; then
+		ifconfig "$TEST_IFACE_GATEWAY1" \
+      "$TEST_IP_GATEWAY1" \
+      netmask 255.255.255.0 \
+      broadcast "$TEST_NETWORK_GATEWAY1" &> /dev/null
+		add_rule "$TEST_IP_GATEWAY1" "$TABLE_GATEWAY1" &> /dev/null
+		ping -I "$TEST_IP_GATEWAY1" -q -w 1 -c 1 "$TEST_REFERENCE" &> /dev/null
+		result=$?
+		ifconfig "$TEST_IFACE_GATEWAY1" down &> /dev/null
+		del_rule "$TEST_IP_GATEWAY1"  &> /dev/null
+	fi
+  # TODO(matthias): Make sure that iptable ACCEPT ping from TEST_IP_GATEWAY2 to TEST_REFERENCE
+	if [[ "$1" == "$TABLE_GATEWAY2" ]] ; then
+    ifconfig "$TEST_IFACE_GATEWAY2" \
+      "$TEST_IP_GATEWAY2" \
+      netmask 255.255.255.0 \
+      broadcast "$TEST_NETWORK_GATEWAY2" &> /dev/null
+    add_rule "$TEST_IP_GATEWAY2" "$TABLE_GATEWAY2" &> /dev/null
+		ping -I "$TEST_IP_GATEWAY2" -q -w 1 -c 1 "$TEST_REFERENCE" &> /dev/null
+    result=$?
+    ifconfig "$TEST_IFACE_GATEWAY2" down &> /dev/null
+    del_rule "$TEST_IP_GATEWAY2" &> /dev/null
+  fi
+	return $result
+}
+
+#######################################
+# Check validity of an IP address
+# Globals:
+#   None
+# Arguments
+#   ip: The address IP that will be tested
+# Returns:
+#   Return 0 for valid IP and 1 for invalid
+function valid_ip(){
+  local ip=$1
+  local stat=1
+  if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    OIFS=$IFS
+    IFS='.'
+    ip=($ip)
+    IFS=$OIFS
+    if [[ ${ip[0]} -le 255 ]] && [[ ${ip[1]} -le 255 ]] \
+      && [[ ${ip[2]} -le 255 ]] && [[ ${ip[3]} -le 255 ]] ; then
+      stat=0
+    fi
+  fi
+  echo $stat
+}
+
+
+#######################################
+# Check validity of a Subnet address
+# Globals:
+#   None
+# Arguments
+#   subnet: The address Subnet that will be tested
+#   errorno: Error code
+# Returns:
+#   Return 0 for valid IP and 1 for invalid
+function valid_subnet(){
+  local subnet=$1
+  local stat=`[[ $# -eq 2 ]] && echo $2 || echo 1`
+  if [[ $subnet =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/(8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30)$ ]]; then
+    OIFS=$IFS
+    IFS='.'
+    ip=(${subnet//\/.*$})
+    IFS=$OIFS
+    if [[ ${ip[0]} -le 255 ]] && [[ ${ip[1]} -le 255 ]] \
+      && [[ ${ip[2]} -le 255 ]] && [[ ${ip[3]} -le 255 ]] ; then
+      stat=0
+    fi
+  fi
+  echo $stat
+}
+
+#######################################
+# Print colored test line
+# Globals:
+#   None
+# Arguments
+#   status: Status of the test (0=OK, 2=Warning, other=Error)
+# Returns:
+#   Return the colored line with status
+function print_line(){
+  local status=
+  case $1 in
+    0)
+      status=$(colorize " [OK]" green)
+      ;;
+    2)
+      status=$(colorize " [WARNING]" yellow)
+      ;;
+    *)
+      status=$(colorize " [FAILED]" red)
+      ;;
+  esac
+  echo " "$(colorize "$2:" blue)" $status"
+}
+
+#######################################
+# Test configuration and system to make sure that all requirement are OK
+# Globals:
+#   IP_GATEWAY1
+#   NETWORK_GATEWAY1
+#   TABLE_GATEWAY1
+#   TEST_PREFIX_GATEWAY1
+#   TEST_IFACE_GATEWAY1
+#   IP_GATEWAY2
+#   NETWORK_GATEWAY2
+#   TABLE_GATEWAY2
+#   TEST_IP_GATEWAY2
+#   TEST_NETWORK_GATEWAY2
+#   TEST_IFACE_GATEWAY2
+# Arguments
+#   None
+# Returns:
+#   None
+function test_all(){
+
+  echo ""
+  colorize "Configuration:" cyan
+  print_line `[[ -d "$RULES_DIRECTORY" ]] && echo 0 || echo 1` "Configuration directory for rules found"
+  print_line `[[ -f "$RULES_DIRECTORY$TABLE_GATEWAY1.conf" ]] && echo 0 || echo 2` "Configuration file for '$TABLE_GATEWAY1' table rules found"
+  print_line `[[ -f "$RULES_DIRECTORY$TABLE_GATEWAY2.conf" ]] && echo 0 || echo 2` "Configuration file for '$TABLE_GATEWAY2' table rules found"
+
+  echo ""
+  colorize "First gateway testing:" cyan
+  print_line `valid_ip "$IP_GATEWAY1"` "Gateway IP ($IP_GATEWAY1) format"
+  print_line `[[ "$IP_GATEWAY1" =~ ^.*\.1$ ]] && echo 0 || echo 2` "Gateway IP ($IP_GATEWAY1) end with '.1'"
+  print_line `valid_subnet "$NETWORK_GATEWAY1"` "Gateway network ($NETWORK_GATEWAY1) format"
+  print_line `[[ -n $(grep "$TABLE_GATEWAY1" /etc/iproute2/rt_tables) ]] && echo 0 || echo 1` "Table '$TABLE_GATEWAY1' exists in /etc/iproute2/rt_tables"
+
+  echo ""
+  colorize "Second gateway testing:" cyan
+  print_line `valid_ip "$IP_GATEWAY2"` "Gateway IP ($IP_GATEWAY2) format"
+  print_line `[[ "$IP_GATEWAY2" =~ ^.*\.1$ ]] && echo 0 || echo 2` "Gateway IP ($IP_GATEWAY2) end with '.1'"
+  print_line `valid_subnet "$NETWORK_GATEWAY2"` "Gateway network ($NETWORK_GATEWAY2) format"
+  print_line `[[ -n $(grep "$TABLE_GATEWAY2" /etc/iproute2/rt_tables) ]] && echo 0 || echo 1` "Table '$TABLE_GATEWAY2' exists in /etc/iproute2/rt_tables"
+
+  echo ""
+}
+
+#######################################
+# Set routes (default + common)
+# Globals:
+#   IP_GATEWAY1
+#   TABLE_GATEWAY1
+#   NETWORK_GATEWAY1
+#   METRIC_GATEWAY1
+#   IP_GATEWAY2
+#   TABLE_GATEWAY2
+#   NETWORK_GATEWAY2
+#   METRIC_GATEWAY2
+# Arguments
+#   None
+# Returns:
+#   None
+function set_routes(){
+	ip route del default via "$IP_GATEWAY1" &> /dev/null
+	ip route del default via "$IP_GATEWAY1" table "$TABLE_GATEWAY1" &> /dev/null
+	ip route del default via "$IP_GATEWAY2" &> /dev/null
+	ip route del default via "$IP_GATEWAY2" table "$TABLE_GATEWAY2" &> /dev/null
+
+	ip route add to "$NETWORK_GATEWAY1" dev "$IFACE_GATEWAY1" &> /dev/null
+	ip route add to "$NETWORK_GATEWAY2" dev "$IFACE_GATEWAY2" &> /dev/null
+
+	ip route add default via "$IP_GATEWAY1" metric $METRIC_GATEWAY1 &> /dev/null
+	ip route add default via "$IP_GATEWAY1" table "$TABLE_GATEWAY1" &> /dev/null
+	ip route add default via "$IP_GATEWAY2" metric $METRIC_GATEWAY2 &> /dev/null
+	ip route add default via "$IP_GATEWAY2" table "$TABLE_GATEWAY2" &> /dev/null
+	
+	ip route flush cache &> /dev/null
+}
+
+#######################################
+# Set routes (default + common)
+# Globals:
+#   TABLE_GATEWAY1
+#   TEST_RESULT_GATEWAY1
+#   TABLE_GATEWAY2
+#   TEST_RESULT_GATEWAY2
+# Arguments
+#   None
+# Returns:
+#   None
+function set_rules(){
+	## Gateway 1 rules
+	if [[ "$TEST_RESULT_GATEWAY1" -eq "0" ]] ; then
+    if [[ -f "/etc/gwswitcher/rules.d/$TABLE_GATEWAY1.conf" ]] ; then
+      for ip in `cat "/etc/gwswitcher/rules.d/$TABLE_GATEWAY1.conf" | grep -v '^#'` ; do
+        if [[ `valid_ip $ip` ]] || [[ `valid_subnet $ip` ]] ; then
+          add_rule "$ip" "$TABLE_GATEWAY1"
+        fi
+      done
+    fi
+	fi
+	## Gateway 2 rules
+	if [[ "$TEST_RESULT_GATEWAY2" -eq "0" ]] ; then
+    if [[ -f "/etc/gwswitcher/rules.d/$TABLE_GATEWAY2.conf" ]] ; then
+      for ip in `cat "/etc/gwswitcher/rules.d/$TABLE_GATEWAY2.conf" | grep -v '^#'` ; do
+        if [[ `valid_ip $ip` ]] || [[ `valid_subnet $ip` ]] ; then
+          add_rule "$ip" "$TABLE_GATEWAY2"
+        fi
+      done
+    fi
+	fi
+}
+
+#######################################
+# Show help
+# Globals:
+#   None
+# Arguments
+#   None
+# Returns:
+#   None
+function show_help(){
+  echo ""
+  colorize "Gateway Switcher usage:" cyan;
+  colorize "  $0 [--default=(ip/table)] [--config=(file)] [--ifdown] [--test]" magenta
+  echo ""
+  echo "  "$(colorize "--default=(ip/table name):" blue)" Switch to this default gateway if available."
+  echo "  "$(colorize "--config=(file):" blue)" Use this specific configuration file."
+  echo "  "$(colorize "--ifdown:" blue)" Only switch gateway if the current is down."
+  echo "  "$(colorize "--test:" blue)" Test configuration and system (no other operation will be done)."
+  echo ""
+}
+
+
+#######################################
+# Parse arguments
+#
+while [[ $# > 0 ]] ; do
+	key="$1"
+	case $key in
+		--config=*)
+			CONFIG_FILE="${key#*=}"			
+			shift
+			;;
+		--default=*)
+			DEFAULT_ROUTE="${key#*=}"			
+			shift
+			;;
+		--ifdown)
+			IFDOWN=1
+			shift
+			;;
+    --test)
+      RUNTEST=1
+      shift
+      ;;
+		*)
+			show_help
+			exit
+			;;
+			
+	esac
+done
+
+
+
+
+
+#######################################
+# Script execution
+
+if [ "$(id -u)" != "0" ]; then
+   echo $(colorize "This script must be run as root" red) 1>&2
+   exit 1
+fi
+
+configure_with "$CONFIG_FILE"
+
+# Only testing system
+if [[ "$RUNTEST" -eq "1" ]] ; then
+  test_all
+  exit 0
+fi
+
+# Check connectivities
+test_table_connectivity "$TABLE_GATEWAY1"
+TEST_RESULT_GATEWAY1=$?
+test_table_connectivity "$TABLE_GATEWAY2"
+TEST_RESULT_GATEWAY2=$?
+
+# Switch only if down
+if [[ "$IFDOWN" -eq "1" ]] ; then
+	if [[ "$CURRENT_GATEWAY" == "$IP_GATEWAY1" ]] && [[ "$TEST_RESULT_GATEWAY1" -eq "0" ]] ; then
+		exit 0;
+	fi
+	if [[ "$CURRENT_GATEWAY" == "$IP_GATEWAY2" ]] && [[ "$TEST_RESULT_GATEWAY2" -eq "0" ]] ; then
+    exit 0;
+  fi
+fi
+
+if [[ "$TEST_RESULT_GATEWAY1" -ne "0" ]] && [[ "$TEST_RESULT_GATEWAY2" -ne "0" ]] ; then
+  colorize "No switch done because no connexion is up!" yellow
+  exit 1;
+fi
+
+# Set gateways metric
+if [[ "$CURRENT_GATEWAY" == "$IP_GATEWAY1" ]] ; then
+    METRIC_GATEWAY1=1
+fi
+if [[ "$CURRENT_GATEWAY" == "$IP_GATEWAY2" ]] ; then
+    METRIC_GATEWAY2=1
+fi
+if [[ "$METRIC_GATEWAY1" == "$METRIC_GATEWAY2" ]] ; then
+    METRIC_GATEWAY1=1
+    METRIC_GATEWAY2=0
+fi
+if [[ "$DEFAULT_GATEWAY" == "$IP_GATEWAY1" ]] || [[ "$DEFAULT_GATEWAY" == "$TABLE_GATEWAY1" ]] ; then
+    METRIC_GATEWAY1=0
+    METRIC_GATEWAY2=1
+fi
+if [[ "$DEFAULT_GATEWAY" == "$IP_GATEWAY2" ]] || [[ "$DEFAULT_GATEWAY" == "$TABLE_GATEWAY2" ]] ; then
+    METRIC_GATEWAY1=1
+    METRIC_GATEWAY2=0
+fi
+if [[ "$TEST_RESULT_GATEWAY1" -eq "0" ]] && [[ "$TEST_RESULT_GATEWAY2" -ne "0" ]] ; then
+	METRIC_GATEWAY1=0
+    METRIC_GATEWAY2=1        
+fi
+if [[ "$TEST_RESULT_GATEWAY1" -ne "0" ]] && [[ "$TEST_RESULT_GATEWAY2" -eq "0" ]] ; then
+    METRIC_GATEWAY1=1
+    METRIC_GATEWAY2=0
+fi
+
+
+set_routes
+set_rules
